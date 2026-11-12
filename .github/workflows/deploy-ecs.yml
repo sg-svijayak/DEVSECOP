@@ -1,0 +1,67 @@
+name: Deploy to ECS
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: /tmp
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image to ECR
+        id: push
+        run: |
+          docker load -i /tmp/image.tar
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}"
+          docker tag "todo-app:${{ github.sha }}" "$IMAGE"
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Render task definition
+        run: |
+          export IMAGE="${{ steps.push.outputs.image }}"
+          export TASK_FAMILY="${{ vars.ECS_TASK_FAMILY }}"
+          export EXECUTION_ROLE_ARN="${{ vars.TASK_EXECUTION_ROLE_ARN }}"
+          export TASK_ROLE_ARN="${{ vars.TASK_ROLE_ARN }}"
+          export LOG_GROUP="${{ vars.LOG_GROUP }}"
+          export AWS_REGION="${{ vars.AWS_REGION }}"
+          envsubst < .aws/task-definition.json > /tmp/task-definition.json
+
+      - id: taskdef
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: /tmp/task-definition.json
+          container-name: todo-app
+          image: ${{ steps.push.outputs.image }}
+
+      - name: Deploy to ECS (waits for stability, rolls back on failure)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.taskdef.outputs.task-definition }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          service: ${{ vars.ECS_SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+          deployment-circuit-breaker-enable: true
+          deployment-circuit-breaker-rollback: true

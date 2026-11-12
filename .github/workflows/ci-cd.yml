@@ -1,0 +1,85 @@
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [DEV, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Per-environment variables (Settings > Environments > dev / production > Variables):
+#   AWS_REGION, AWS_ROLE_ARN (OIDC deploy role), ECR_REPOSITORY,
+#   ECS_CLUSTER, ECS_SERVICE, ECS_TASK_FAMILY,
+#   TASK_EXECUTION_ROLE_ARN, TASK_ROLE_ARN, LOG_GROUP
+# No long-lived AWS keys: authentication is GitHub OIDC -> IAM role.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Unit tests
+        run: pytest -q
+      - name: Dependency vulnerability scan
+        run: pip-audit -r requirements.txt
+
+  # Build once, scan, and keep the image as an artifact so the exact scanned
+  # image is what gets pushed to each environment's ECR.
+  build:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: todo-app:${{ github.sha }}
+          outputs: type=docker,dest=/tmp/image.tar
+      - run: docker load -i /tmp/image.tar
+      - name: Scan image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: todo-app:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  deploy-dev:
+    needs: build
+    if: github.ref == 'refs/heads/DEV'
+    uses: ./.github/workflows/deploy-ecs.yml
+    with:
+      environment: dev
+    permissions:
+      id-token: write
+      contents: read
+
+  deploy-prod:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/deploy-ecs.yml
+    with:
+      environment: production # add required reviewers on this environment for manual approval
+    permissions:
+      id-token: write
+      contents: read
